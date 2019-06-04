@@ -124,7 +124,7 @@ class DaliDataIterator():
             batch_elements = self.batch_size
             buffer_size = self.batch_size
 
-            if current_iter == self.__len__() - 1:
+            if self.current_iter == self.__len__() - 1:
                 batch_elements = self.partial_batch_config[self.rank]
 
                 # return 1 dummy item if there are no more real items to return
@@ -183,7 +183,7 @@ class DaliDataIterator():
 
             data = torch.cat(data, dim=0)
 
-            current_iter += 1
+            self.current_iter += 1
  
             if self.training:
                 pyt_targets = pyt_targets.cuda(non_blocking=True)
