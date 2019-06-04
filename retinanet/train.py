@@ -155,7 +155,7 @@ def train(model, state, path, annotations, val_path, val_annotations, resize, ma
 
             if iteration == iterations:
                 break
-
+        if use_dali: data_iterator.reset()
     if logdir is not None:
         writer.close()
 

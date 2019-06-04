@@ -11,16 +11,14 @@ from pycocotools.coco import COCO
 class COCOPipeline(pipeline.Pipeline):
     'Dali pipeline for COCO'
 
-    def __init__(self, batch_size, num_threads, path, coco, training, annotations, world, device_id, mean, std, resize, max_size, stride):
+    def __init__(self, batch_size, num_threads, path, training, annotations, world, device_id, mean, std, resize, max_size, stride):
         super().__init__(batch_size=batch_size, num_threads=num_threads, device_id = device_id, prefetch_queue_depth=num_threads, seed=42)
 
         self.path = path
         self.training = training
-        self.coco = coco
         self.stride = stride
-        self.iter = 0
 
-        self.reader = ops.COCOReader(annotations_file=annotations, file_root=path, num_shards=world,shard_id=torch.cuda.current_device(), 
+        self.reader = ops.COCOReader(annotations_file=annotations, file_root=path, num_shards=world,shard_id=device_id,
                                      ltrb=True, ratio=True, shuffle_after_epoch=True, save_img_ids=True)
 
         self.decode_train = ops.nvJPEGDecoderSlice(device="mixed", output_type=types.RGB)
@@ -78,18 +76,27 @@ class DaliDataIterator():
         self.mean = [255.*x for x in [0.485, 0.456, 0.406]]
         self.std = [255.*x for x in [0.229, 0.224, 0.225]]
         self.world = world
+        self.rank = torch.cuda.current_device()
         self.path = path
 
         # Setup COCO
         with redirect_stdout(None):
             self.coco = COCO(annotations)
         self.ids = list(self.coco.imgs.keys())
-        if 'categories' in self.coco.dataset:
-            self.categories_inv = { k: i for i, k in enumerate(self.coco.getCatIds()) }
+
+        total_extras = (self.__len__() * self.batch_size * world) % len(self.ids)
+        valid_data = self.batch_size * world - total_extras
+        self.valid_gpus = ceil(valid_data / self.batch_size)
+        self.partial_data = valid_data % self.batch_size
+
+        self.partial_batch_config = [self.batch_size if i < self.valid_gpus else 0 for i in range(world)]
+        self.partial_batch_config[self.valid_gpus - 1] = self.partial_data
+
+        self.current_iter = 0
 
         self.pipe = COCOPipeline(batch_size=self.batch_size, num_threads=2, 
-            path=path, coco=self.coco, training=training, annotations=annotations, world=world, 
-            device_id = torch.cuda.current_device(), mean=self.mean, std=self.std, resize=resize, max_size=max_size, stride=self.stride)
+            path=path, training=training, annotations=annotations, world=world,
+            device_id=self.rank, mean=self.mean, std=self.std, resize=resize, max_size=max_size, stride=self.stride)
 
         self.pipe.build()
 
@@ -99,28 +106,46 @@ class DaliDataIterator():
             '    resize: {}, max: {}'.format(self.resize, self.max_size),
         ])
 
+
+    def reset(self):
+        self.current_iter = 0
+        self.pipe.reset()
+
     def __len__(self):
-        return ceil(len(self.ids) // self.world / self.batch_size)
+        return ceil(len(self.ids) / self.batch_size / self.world)
 
     def __iter__(self):
         for _ in range(self.__len__()):
 
+            num_detections = []
             data, ratios, ids, num_detections = [], [], [], []
             dali_data, dali_boxes, dali_labels, dali_ids, dali_attrs, dali_resize_img = self.pipe.run()
+
+            batch_elements = self.batch_size
+            buffer_size = self.batch_size
+
+            if current_iter == self.__len__() - 1:
+                batch_elements = self.partial_batch_config[self.rank]
+
+                # return 1 dummy item if there are no more real items to return
+                if batch_elements == 0: buffer_size = 1
 
             for l in range(len(dali_boxes)):
                 num_detections.append(dali_boxes.at(l).shape[0])
 
-            pyt_targets = -1 * torch.ones([len(dali_boxes), max(max(num_detections),1), 5])
+            pyt_targets = -1 * torch.ones([buffer_size, max(max(num_detections),1), 5])
+            data = [torch.zeros(dali_data.at(0).shape(), dtype=torch.float, device=torch.device('cuda')) for i in range(buffer_size)]
+            ratios = [1] * buffer_size
+            ids = [-1] * buffer_size
 
-            for batch in range(self.batch_size):
+
+            for batch in range(batch_elements):
                 id = int(dali_ids.at(batch)[0])
                 
                 # Convert dali tensor to pytorch
                 dali_tensor = dali_data.at(batch)
-                tensor_shape = dali_tensor.shape()
 
-                datum = torch.zeros(dali_tensor.shape(), dtype=torch.float, device=torch.device('cuda'))
+                datum = data[batch]
                 c_type_pointer = ctypes.c_void_p(datum.data_ptr())
                 dali_tensor.copy_to_external(c_type_pointer)
 
@@ -152,12 +177,14 @@ class DaliDataIterator():
                         pyt_label -= 1 #Rescale labels to [0,79] instead of [1,80]
                         pyt_targets[batch,:num_dets, 4] = pyt_label.squeeze()
 
-                ids.append(id)
-                data.append(datum.unsqueeze(0))
-                ratios.append(ratio)
+                ids[batch] = id
+                ratios[batch] = ratio
+                data[batch] = data[batch].unsqueeze(0)
 
             data = torch.cat(data, dim=0)
 
+            current_iter += 1
+ 
             if self.training:
                 pyt_targets = pyt_targets.cuda(non_blocking=True)
 
@@ -168,3 +195,5 @@ class DaliDataIterator():
                 ratios = torch.Tensor(ratios).cuda(non_blocking=True)
 
                 yield data, ids, ratios
+
+
