@@ -18,8 +18,8 @@ class COCOPipeline(pipeline.Pipeline):
         self.training = training
         self.stride = stride
 
-        self.reader = ops.COCOReader(annotations_file=annotations, file_root=path, num_shards=world,shard_id=device_id,
-                                     ltrb=True, ratio=True, shuffle_after_epoch=True, save_img_ids=True)
+        self.reader = ops.COCOReader(annotations_file=annotations, file_root=path, num_shards=world, shard_id=device_id, 
+                                     ltrb=True, ratio=True, save_img_ids=True, stick_to_shard=True)
 
         self.decode_train = ops.nvJPEGDecoderSlice(device="mixed", output_type=types.RGB)
         self.decode_infer = ops.nvJPEGDecoder(device="mixed", output_type=types.RGB)
@@ -29,7 +29,7 @@ class COCOPipeline(pipeline.Pipeline):
         self.img_flip = ops.Flip(device='gpu')
         self.coin_flip = ops.CoinFlip(probability=0.5)
 
-        if isinstance(resize, list): resize = max(resize)
+        if isinstance(resize, list): resize = min(resize)
         self.rand_resize = ops.Uniform(range=[resize, float(max_size)])
 
         self.resize_train = ops.Resize(device='gpu', interp_type=types.DALIInterpType.INTERP_CUBIC, save_attrs=True)
@@ -76,23 +76,15 @@ class DaliDataIterator():
         self.mean = [255.*x for x in [0.485, 0.456, 0.406]]
         self.std = [255.*x for x in [0.229, 0.224, 0.225]]
         self.world = world
-        self.rank = torch.cuda.current_device()
         self.path = path
+        self.rank = torch.cuda.current_device()
+        self.seen_ids = set()
+        self.ignored = 0
 
         # Setup COCO
         with redirect_stdout(None):
             self.coco = COCO(annotations)
         self.ids = list(self.coco.imgs.keys())
-
-        total_extras = (self.__len__() * self.batch_size * world) % len(self.ids)
-        valid_data = self.batch_size * world - total_extras
-        self.valid_gpus = ceil(valid_data / self.batch_size)
-        self.partial_data = valid_data % self.batch_size
-
-        self.partial_batch_config = [self.batch_size if i < self.valid_gpus else 0 for i in range(world)]
-        self.partial_batch_config[self.valid_gpus - 1] = self.partial_data
-
-        self.current_iter = 0
 
         self.pipe = COCOPipeline(batch_size=self.batch_size, num_threads=2, 
             path=path, training=training, annotations=annotations, world=world,
@@ -100,51 +92,51 @@ class DaliDataIterator():
 
         self.pipe.build()
 
+    def reset(self):
+        self.seen_ids.clear()
+        self.pipe.reset()
+        self.ignored = 0
+
     def __repr__(self):
         return '\n'.join([
             '    loader: dali',
             '    resize: {}, max: {}'.format(self.resize, self.max_size),
         ])
 
-
-    def reset(self):
-        self.current_iter = 0
-        self.pipe.reset()
-
     def __len__(self):
-        return ceil(len(self.ids) / self.batch_size / self.world)
+        return ceil(len(self.ids) / self.world / self.batch_size)
 
     def __iter__(self):
+
         for _ in range(self.__len__()):
 
-            num_detections = []
             data, ratios, ids, num_detections = [], [], [], []
             dali_data, dali_boxes, dali_labels, dali_ids, dali_attrs, dali_resize_img = self.pipe.run()
 
-            batch_elements = self.batch_size
-            buffer_size = self.batch_size
-
-            if self.current_iter == self.__len__() - 1:
-                batch_elements = self.partial_batch_config[self.rank]
-
-                # return 1 dummy item if there are no more real items to return
-                if batch_elements == 0: buffer_size = 1
-
-            for l in range(len(dali_boxes)):
+            data_mask = [i for i in range(self.batch_size)]
+            for l in range(self.batch_size):
                 num_detections.append(dali_boxes.at(l).shape[0])
+                id = int(dali_ids.at(l)[0])
+                # DALI will sometimes read past the end of a shard
+                # Ignore image if we have seen it already it
+                if id in self.seen_ids:
+                    data_mask[l] = -1
+                    self.ignored += 1
+                else:
+                    self.seen_ids.add(id)
 
-            pyt_targets = -1 * torch.ones([buffer_size, max(max(num_detections),1), 5])
-            data = [torch.zeros(dali_data.at(0).shape(), dtype=torch.float, device=torch.device('cuda')) for i in range(buffer_size)]
-            ratios = [1] * buffer_size
-            ids = [-1] * buffer_size
+            # Prepare buffers
+            targets = -1 * torch.ones([self.batch_size, max(max(num_detections),1), 5])
+            data = [torch.zeros(dali_data.at(0).shape(), dtype=torch.float, device=torch.device('cuda')) for i in range(self.batch_size)]
+            ratios = [1] * self.batch_size
+            ids = [-1] * self.batch_size
 
-
-            for batch in range(batch_elements):
+            # Only populate buffers for valid images
+            for batch in [x for x in data_mask if x > -1]: 
                 id = int(dali_ids.at(batch)[0])
                 
                 # Convert dali tensor to pytorch
                 dali_tensor = dali_data.at(batch)
-
                 datum = data[batch]
                 c_type_pointer = ctypes.c_void_p(datum.data_ptr())
                 dali_tensor.copy_to_external(c_type_pointer)
@@ -159,41 +151,37 @@ class DaliDataIterator():
                     b_arr = dali_boxes.at(batch)
                     num_dets = b_arr.shape[0]
                     if num_dets is not 0:
-                        pyt_bbox = torch.from_numpy(b_arr).float()
+                        bbox = torch.from_numpy(b_arr).float()
 
-                        pyt_bbox[:,0] *= float(prior_size[1])
-                        pyt_bbox[:,1] *= float(prior_size[0])
-                        pyt_bbox[:,2] *= float(prior_size[1])
-                        pyt_bbox[:,3] *= float(prior_size[0])
+                        bbox[:,0] *= float(prior_size[1])
+                        bbox[:,1] *= float(prior_size[0])
+                        bbox[:,2] *= float(prior_size[1])
+                        bbox[:,3] *= float(prior_size[0])
                         # (l,t,r,b) ->  (x,y,w,h) == (l,r, r-l, b-t)
-                        pyt_bbox[:,2] -= pyt_bbox[:,0]
-                        pyt_bbox[:,3] -= pyt_bbox[:,1]
-                        pyt_targets[batch,:num_dets,:4] = pyt_bbox * ratio
+                        bbox[:,2] -= bbox[:,0]
+                        bbox[:,3] -= bbox[:,1]
+                        targets[batch,:num_dets,:4] = bbox * ratio
 
                     # Arrange labels in target tensor
                     l_arr = dali_labels.at(batch)
                     if num_dets is not 0:
-                        pyt_label = torch.from_numpy(l_arr).float()
-                        pyt_label -= 1 #Rescale labels to [0,79] instead of [1,80]
-                        pyt_targets[batch,:num_dets, 4] = pyt_label.squeeze()
+                        label = torch.from_numpy(l_arr).float()
+                        label -= 1 #Rescale labels to [0,79] instead of [1,80]
+                        targets[batch,:num_dets, 4] = label.squeeze()
 
                 ids[batch] = id
                 ratios[batch] = ratio
-                data[batch] = data[batch].unsqueeze(0)
 
+            data = [x.unsqueeze(0) for x in data]
             data = torch.cat(data, dim=0)
 
-            self.current_iter += 1
- 
             if self.training:
-                pyt_targets = pyt_targets.cuda(non_blocking=True)
+                targets = targets.cuda(non_blocking=True)
 
-                yield data, pyt_targets
+                yield data, targets
 
             else:
                 ids = torch.Tensor(ids).int().cuda(non_blocking=True)
                 ratios = torch.Tensor(ratios).cuda(non_blocking=True)
 
                 yield data, ids, ratios
-
-

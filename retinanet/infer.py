@@ -66,9 +66,7 @@ def infer(model, path, detections_file, resize, max_size, batch_size, mixed_prec
             scores, boxes, classes = model(data)
             profiler.stop('fw')
 
-            # Don't accumulate dummy results
-            if torch.sum(ids) > 0: results.append([scores, boxes, classes, ids, ratios])
-
+            results.append([scores, boxes, classes, ids, ratios]) 
             profiler.bump('infer')
             if verbose and (profiler.totals['infer'] > 60 or i == len(data_iterator) - 1):
                 size = len(data_iterator.ids)
@@ -95,17 +93,20 @@ def infer(model, path, detections_file, resize, max_size, batch_size, mixed_prec
         results = [r.cpu() for r in results]
 
         # Collect detections
-        detections = []
-        id_dump = []
+        detections, id_tracker = [], []
         for scores, boxes, classes, ids, ratios in zip(*results):
+            if ids.item() < 0: 
+                continue
+            else: 
+                id_tracker.append(ids.item())
+
             keep = (scores > 0).nonzero()
             scores = scores[keep].view(-1)
             boxes = boxes[keep, :].view(-1, 4) / ratios
             classes = classes[keep].view(-1).int()
-            id_dump.append(ids.item())
+
             for score, box, cat in zip(scores, boxes, classes):
                 x1, y1, x2, y2 = box.data.tolist()
-                cat = cat.item()
                 if 'annotations' in data_iterator.coco.dataset:
                     cat = data_iterator.coco.getCatIds()[cat]
                 detections.append({
@@ -115,7 +116,7 @@ def infer(model, path, detections_file, resize, max_size, batch_size, mixed_prec
                     'category_id': cat
                 })
 
-        print('evaluating detections from {} images'.format(len(set(id_dump))))
+        print('evaluating detections from {} unique images ({} total)'.format(len(set(id_tracker)), len(id_tracker)))
         if detections:
             # Save detections
             if detections_file and verbose: print('Writing {}...'.format(detections_file))
